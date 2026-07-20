@@ -1,4 +1,6 @@
-
+import threading
+import time
+import sys
 import os
 import re
 import json
@@ -56,13 +58,18 @@ CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar.events',
  
  
 def ask_agent():
-    which = input("Which Agent would you like to use?")
-    if which == 'Agent 1' or '1' in which or 'Agent 1' in which:
-        run_chat() # run agent 1
-    elif which == 'Agent 2' or '2' in which or 'Agent 2' in which:
-        running_chat() # run agent 2
-    else:
-        print("Please pick an available agent.")
+    while True:
+        which = input("Which Agent would you like to use? (1 = UI Design Agent, 2 = UX Helper AI): ").strip().lower()
+        if which == '1' or 'agent 1' in which:
+            result = run_chat()
+        elif which == '2' or 'agent 2' in which:
+            result = running_chat()
+        else:
+            print("Please pick an available agent (1 or 2).")
+            continue
+
+        if result != 'switch':
+            break
 
 
  #checks if the credentials.json exists and uses it to to acceess the google calendar and returns None so an error doesnt appear. Also uses tokens.json if its previously logged in.
@@ -110,6 +117,34 @@ def fetch_google_busy_times(service, days_ahead=28):
     return "\n".join(lines)
  
  #creates the actual event with the description summary and uses the date as well.
+
+
+def show_loading(stop_event, message="Thinking"):
+    dots = 0
+    while not stop_event.is_set():
+        sys.stdout.write(f"\r{message}{'.' * (dots % 4):<4}")
+        sys.stdout.flush()
+        dots += 1
+        time.sleep(0.4)
+    sys.stdout.write("\r" + " " * (len(message) + 4) + "\r")
+    sys.stdout.flush()
+
+
+def with_loading(func, message="Thinking"):
+    """Runs func() while showing an animated loading line in the terminal."""
+    result = {}
+    def target():
+        result['value'] = func()
+    stop_event = threading.Event()
+    spinner = threading.Thread(target=show_loading, args=(stop_event, message))
+    worker = threading.Thread(target=target)
+    spinner.start()
+    worker.start()
+    worker.join()
+    stop_event.set()
+    spinner.join()
+    return result['value']
+
 def create_calendar_events(service, sessions):
     """Inserts parsed schedule sessions as events on the user's primary calendar."""
     created = 0
@@ -140,7 +175,7 @@ def describe_calendar_image(path):
     with open(path, 'rb') as f:
         img_b64 = base64.b64encode(f.read()).decode('utf-8')
  
-    response = client.messages.create(
+    response = with_loading(lambda: client.messages.create(
         model=MODEL,
         max_tokens=500,
         messages=[{
@@ -151,7 +186,7 @@ def describe_calendar_image(path):
                                           "as plain text lines (day/date + time range). Just the list, no extra commentary."}
             ]
         }]
-    )
+    ))
     return response.content[0].text
  
  
@@ -175,7 +210,7 @@ def ask_claude(system, messages, max_tokens=800, temperature=0.7, tools=None):
                   system=system, messages=messages)
     if tools:
         kwargs['tools'] = tools
-    return client.messages.create(**kwargs)
+    return with_loading(lambda: client.messages.create(**kwargs))
  
  
 def cmd_schedule(history):
@@ -308,6 +343,8 @@ Requirements:
         print("Opened it in your browser.")
     except Exception:
         print("Open it manually in a browser to view it.")
+    return filename
+
  
 
  #uses similair code to the previous mockup function but reads the current HTML code and alters it in the way asked by the user, instead of making a new mockup each time.
@@ -395,14 +432,14 @@ Material Design) if relevant, and common usability pitfalls for this audience.
 Write it as actionable markdown bullet points grouped under short subheadings.
 Briefly note the source of any specific claim in parentheses."""
  
-    search_response = client.messages.create(
-        model=MODEL,
+    search_response = with_loading(lambda: client.messages.create(
+        model=MODEL, 
         max_tokens=1200,
         system="You are a UX researcher. Use web search to find current, specific, practical "
                "UI design guidance. Keep it concise and actionable.",
         messages=[{'role': 'user', 'content': search_prompt}],
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
-    )
+    ))
     audience_content = "\n".join(
         block.text for block in search_response.content if getattr(block, 'type', None) == 'text'
     ).strip()
@@ -490,7 +527,11 @@ Suggest one concrete action the user can take.
 
         if user_input.lower() == "exit":
             print("Goodbye!")
-            break
+            return 'exit'
+        
+        if user_input.lower() == "switch":
+            print("Switching agents...")
+            return 'switch'
 
         if user_input.lower() == "reset":
             history = []
@@ -516,13 +557,13 @@ Suggest one concrete action the user can take.
             }
         )
 
-        response = client.messages.create(
+        response = with_loading(lambda: client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
             temperature=0.7,
             system=system_message,
             messages=history
-        )
+        ))
 
         reply = response.content[0].text
 
@@ -559,7 +600,7 @@ def run_chat():
  
         if low == 'exit' or 'quit' in low or 'bye' in low or 'goodbye' in low or 'end' in low:
             print("Exiting. Good luck with the design!")
-            break
+            return 'exit'
  
         if low == 'help' or 'commands' in low or 'options' in low:
             print("Available commands: 'schedule', 'mockup', 'basics', 'summary', 'reset', 'exit'")
@@ -575,8 +616,12 @@ def run_chat():
             cmd_schedule(history)
             continue
  
+        if low == 'switch' or 'switch' in low:
+            print('Switching agents...')
+            return 'switch'
+
         if low == 'mockup' or 'mockup' in low or 'html' in low or 'prototype' in low:
-            edit_list = ['change', 'edit', 'update', 'modify', 'replace' 'can you', 'make it', 'adjust', 'improve', 'fix']
+            edit_list = ['change', 'edit', 'update', 'modify', 'replace', 'can you', 'make it', 'adjust', 'improve', 'fix']
             edit_detected = any(word in low for word in edit_list)
             if edit_detected and lastmockup_path:
                 cmd_edit_mockup(user_input, lastmockup_path)
@@ -584,7 +629,6 @@ def run_chat():
                 if edit_detected and not lastmockup_path:
                     print("No previous mockup found to edit. Please create a mockup first.")
                 lastmockup_path = cmd_mockup(user_input)
-            cmd_mockup(history)
             continue
  
         if low == 'basics' or 'basics' in low or 'reference' in low or 'guide' in low:
