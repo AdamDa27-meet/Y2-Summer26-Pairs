@@ -60,17 +60,165 @@ def ask_agent():
     """Lets the user pick between the two agents, and loops back here whenever
     either agent returns 'switch' instead of quitting entirely."""
     while True:
-        which = input("Which Agent would you like to use? (1 = UI Design Agent, 2 = UX Helper AI): ").strip().lower()
+        which = input("Which Agent would you like to use? (1 = UI Design Agent, 2 = UX Helper AI, 3 = Both agents): ").strip().lower()
+        print('Remember that if you wish to use a specific function, like schedule or export, use that specific agent, and not the combined agents.')
         if which == '1' or 'agent 1' in which:
             result = run_chat()
         elif which == '2' or 'agent 2' in which:
             result = running_chat()
+        elif which == '3' or 'both' in which or 'collaboration'  in which:
+            result = run_both()
         else:
             print("Please pick an available agent (1 or 2).")
             continue
 
         if result != 'switch':
             break
+
+def run_both():
+    '''This runs both agents at the same time in situations where its required.'''
+    print('-- Welcome to Dual --')
+    print('Every message is processed by both Agents.')
+    print('The best option is printed and shown.')
+    print("Type 'switch' to change to agents, or 'exit' to quit the app.")
+
+    global goal
+    goal = 'What are you designing / What is your goal for this session'
+    
+    pixel_system = SYSTEM_MESSAGE + f"\n\nThe user's current goal for this session: {goal}"
+    ux_system = """
+WHO:
+You are UX Helper AI, a UX design assistant.
+
+WHAT:
+Help users improve the UX of any web or mobile application.
+
+You should:
+- Identify the target audience.
+- Suggest accessibility improvements.
+- Explain how to make the app user-friendly.
+- Recommend UX best practices.
+- Give constructive feedback on app ideas.
+
+WHAT YOU WILL NOT DO:
+- Do not answer unrelated questions.
+- Do not invent research or statistics.
+- Do not generate code.
+- Keep answers focused on UX.
+"""
+    ux_history = []
+    ui_history = []
+    username = input("AI: What should I call you? ").strip()
+
+    while True:
+        user_input = input(f'\n >>{username.capitalize()}:').strip()
+        if user_input == '':
+            print("Please enter a message.")
+            continue
+
+        low = user_input.lower()
+
+        if low == 'exit' or 'quit' in low or 'exit' in low:
+            print('Exiting. Good luck with your project!')
+            return 'exit'
+        
+        if low == 'switch':
+            print('Switching mode.')
+            return 'switch'
+
+        if low == 'reset':
+            pixel_history = []
+            ux_history = []
+            print('History entirely cleared.')
+            continue
+
+        pixel_history = []
+        ux_history = []
+
+
+        pixel_history.append({'role': 'user', 'content': user_input})
+        ux_history.append({'role': 'user', 'content': user_input})
+
+        pixel_response = ask_claude(pixel_system, pixel_history, max_tokens=500)
+        pixel_reply = pixel_response.content[0].text
+
+        ux_response = ask_claude(ux_system, ux_history, max_tokens=500)
+        ux_reply = ux_response.content[0].text
+
+    
+        pixel_history.append({'role': 'user', 'content': pixel_reply})
+        ux_history.append({'role': 'user', 'content': ux_reply})
+
+        current, winner = judge_and_combine(user_input, pixel_reply, ux_reply)
+
+        if current == 'single':
+            agent, reply = winner
+            print(f'\n {agent} had the more accurate answer wiht: {reply} ')
+        elif current == 'both':
+            pixel_reply, ux_reply = winner
+            print(f'\nBoth agents can answer this question.\n\n Pixel (UI): {pixel_reply}.\n\nUX agent: {ux_reply}')
+        else:
+            print(f'\nYour combined answer said: {winner}')
+
+
+
+
+def judge_and_combine(user_input, pixel_reply, ux_reply):
+    """Asks Claude to evaluate both replies and decide how to present them:
+    - one clearly answers the question better -> show just that one
+    - both are relevant but cover different angles -> show both, labeled
+    - both say similar things -> merge into a single combined answer
+    Returns a tuple: (mode, content) where mode is 'single', 'both', or 'combined'."""
+    judge_prompt = f"""A user asked: "{user_input}"
+
+Two different assistants replied:
+
+--- Agent A (Pixel, a UI/UX design mentor focused on visual design) ---
+{pixel_reply}
+
+--- Agent B (UX Helper AI, focused on UX strategy/audience/accessibility) ---
+{ux_reply}
+
+Decide how these two responses should be presented to the user. Choose exactly one:
+- "SINGLE_A" — Agent A's response is clearly the better and more relevant answer, Agent B's isn't very useful here
+- "SINGLE_B" — Agent B's response is clearly the better and more relevant answer, Agent A's isn't very useful here
+- "BOTH" — both responses are genuinely useful but cover different, complementary angles worth showing separately
+- "COMBINE" — both responses overlap significantly and would read better merged into one unified answer
+
+Respond with ONLY one of these exact words: SINGLE_A, SINGLE_B, BOTH, or COMBINE"""
+
+    response = ask_claude(
+        system="You are a strict, impartial judge. Respond with exactly one of the four allowed words, nothing else.",
+        messages=[{'role': 'user', 'content': judge_prompt}],
+        max_tokens=10,
+        temperature=0,
+    )
+    choice = response.content[0].text.strip().upper()
+
+    if choice.startswith('SINGLE_A'):
+        return ('single', ('Pixel', pixel_reply))
+    elif choice.startswith('SINGLE_B'):
+        return ('single', ('UX Helper AI', ux_reply))
+    elif choice.startswith('COMBINE'):
+        combine_prompt = f"""A user asked: "{user_input}"
+
+Merge these two responses into a single, coherent, non-repetitive answer.
+Keep the best insight from each, remove redundancy, and write it as one unified response.
+
+--- Response 1 ---
+{pixel_reply}
+
+--- Response 2 ---
+{ux_reply}"""
+        combined_response = ask_claude(
+            system="You are an editor. Merge two overlapping responses into one clear, non-redundant answer.",
+            messages=[{'role': 'user', 'content': combine_prompt}],
+            max_tokens=600,
+        )
+        return ('combined', combined_response.content[0].text)
+    else:
+        return ('both', (pixel_reply, ux_reply))
+
 
 
 # checks if the credentials.json exists and uses it to access the google calendar and
@@ -97,6 +245,7 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
+
 # when accessing the google calendar it finds busy and free times within the next 28 days
 def fetch_google_busy_times(service, days_ahead=28):
     """Returns a plain-text list of upcoming events so Claude can schedule around them."""
@@ -119,6 +268,7 @@ def fetch_google_busy_times(service, days_ahead=28):
     return "\n".join(lines)
 
 
+
 def show_loading(stop_event, message="Thinking"):
     """Animates a '...' loading line in the terminal until stop_event is set."""
     dots = 0
@@ -129,6 +279,7 @@ def show_loading(stop_event, message="Thinking"):
         time.sleep(0.4)
     sys.stdout.write("\r" + " " * (len(message) + 4) + "\r")
     sys.stdout.flush()
+
 
 
 def with_loading(func, message="Thinking"):
@@ -148,6 +299,7 @@ def with_loading(func, message="Thinking"):
     return result['value']
 
 
+
 def create_calendar_events(service, sessions):
     """Inserts parsed schedule sessions as events on the user's primary calendar."""
     created = 0
@@ -164,6 +316,7 @@ def create_calendar_events(service, sessions):
         except Exception as e:
             print(f"Could not add session '{s.get('title')}': {e}")
     return created
+
 
 
 def describe_calendar_image(path):
@@ -193,6 +346,7 @@ def describe_calendar_image(path):
     return response.content[0].text
 
 
+
 def extract_json_sessions(text):
     """Pulls the fenced ```json [...] ``` block out of Claude's schedule response, if present."""
     match = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
@@ -204,8 +358,10 @@ def extract_json_sessions(text):
         return []
 
 
+
 def strip_json_block(text):
     return re.sub(r'```json.*?```', '', text, flags=re.DOTALL).strip()
+
 
 
 def ask_claude(system, messages, max_tokens=800, temperature=0.7, tools=None):
@@ -214,6 +370,7 @@ def ask_claude(system, messages, max_tokens=800, temperature=0.7, tools=None):
     if tools:
         kwargs['tools'] = tools
     return with_loading(lambda: client.messages.create(**kwargs))
+
 
 
 def cmd_schedule(history):
@@ -296,6 +453,7 @@ Then, output the exact same sessions as a fenced JSON block with this schema:
                   "See README.md if you'd like to enable calendar sync.)")
 
 
+
 def cmd_mockup(user_message=None):
     """Generate a self-contained HTML/CSS file for a described screen, then open it in a browser.
     Returns the path to the saved file (so it can be tracked for later edits)."""
@@ -346,6 +504,7 @@ Requirements:
     return filename
 
 
+
 def cmd_edit_mockup(instruction, filepath):
     """Applies a natural-language change to an existing mockup file, in place."""
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -385,6 +544,7 @@ change. Output ONLY the HTML code, no explanation, no markdown code fences."""
         print("Open it manually in a browser to see the changes.")
 
     return filepath
+
 
 
 def cmd_basics():
@@ -466,6 +626,7 @@ Briefly note the source of any specific claim in parentheses."""
     return full_content
 
 
+
 def read_text_file(path):
     """Reads a file from disk and returns its text content, regardless of format.
     Figures out how to read it based on the file's extension (.txt, .pdf, .docx, etc.)."""
@@ -488,6 +649,7 @@ def read_text_file(path):
         return None
 
 
+
 def read_pdf_file(path):
     """Extracts all the text from a PDF, page by page, and joins it into one string."""
     reader = pypdf.PdfReader(path)
@@ -495,11 +657,13 @@ def read_pdf_file(path):
     return "\n\n".join(pages_text)
 
 
+
 def read_docx_file(path):
     """Extracts all the text from a Word document, paragraph by paragraph."""
     doc = DocxDocument(path)
     paragraphs_text = [p.text for p in doc.paragraphs]
     return "\n".join(paragraphs_text)
+
 
 
 def chunk_text(text, chunk_size=12000):
@@ -514,6 +678,7 @@ def chunk_text(text, chunk_size=12000):
     if text.strip():
         chunks.append(text)
     return chunks
+
 
 
 def summarize_large_text(text, instruction="Summarize this document, highlighting the key points."):
@@ -547,6 +712,7 @@ def summarize_large_text(text, instruction="Summarize this document, highlightin
     return final_response.content[0].text
 
 
+
 def cmd_analyze_file(user_message=None):
     """Reads a file (or accepts pasted text) and summarizes/analyzes it."""
     if user_message and user_message.strip().lower() not in ('read file', 'analyze file', 'summarize file'):
@@ -570,11 +736,13 @@ def cmd_analyze_file(user_message=None):
     print(f"\n{result}\n")
 
 
+
 def export_to_file(content):
     filename = "UX_Report.txt"
     with open(filename, "w", encoding="utf-8") as file:
         file.write(content)
     return filename
+
 
 
 def running_chat():
@@ -659,11 +827,13 @@ Suggest one concrete action the user can take.
         history.append({"role": "assistant", "content": reply})
 
 
+
 def run_chat():
     print("Welcome! Pixel here — your UI design assistant.")
     print("Commands: 'schedule', 'mockup', 'basics', 'analyze file', 'summary', 'switch', 'reset', 'exit'")
     global goal
     goal = input("\nWhat are you designing / what's your goal for this session?: ")
+    global username
     username = input("Pixel: What should I call you? ").strip()
     history = []
 
@@ -766,6 +936,7 @@ def run_chat():
         usage = response.usage
         total = usage.input_tokens + usage.output_tokens
         print(f"[tokens: {usage.input_tokens} in / {usage.output_tokens} out / {total} total]")
+
 
 
 if __name__ == '__main__':
