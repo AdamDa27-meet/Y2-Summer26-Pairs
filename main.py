@@ -6,43 +6,43 @@ import re
 import json
 import base64
 import webbrowser
-from datetime import datetime, timedelta
+import pypdf
+from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
 from dotenv import load_dotenv
- 
+from docx import Document as DocxDocument
+
 load_dotenv()
- 
+
 client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
- 
+
 BASE_DIR = os.path.dirname(__file__)
 MOCKUP_DIR = os.path.join(BASE_DIR, 'mockups')
 BASICS_FILE = os.path.join(BASE_DIR, 'ui_design_basics.md')
 SCHEDULE_FILE = os.path.join(BASE_DIR, 'schedule.md')
 CREDS_FILE = os.path.join(BASE_DIR, 'credentials.json')   # from Google Cloud Console (see README)
 TOKEN_FILE = os.path.join(BASE_DIR, 'token.json')          # auto-created after first Google login
- 
+
 os.makedirs(MOCKUP_DIR, exist_ok=True)
- 
+
 MODEL = 'claude-haiku-4-5-20251001'
- 
 
 TIMEZONE = 'Asia/Jerusalem'
- 
+
 SYSTEM_MESSAGE = """You are Pixel, a senior UI/UX designer and mentor.
- 
+
 Your ONLY focus is user interface and user experience design — layout, visual
 hierarchy, color, typography, spacing, component choice, accessibility, and
 usability flow. You do not write backend logic, databases, or app architecture
 unless it directly affects the UI.
- 
+
 Keep responses practical and concrete. When giving feedback, point to specific
 design principles (contrast, whitespace, affordance, consistency, etc.) rather
 than vague opinions. Ask a clarifying question only when you genuinely can't
 proceed without it.
 """
- 
 
- # how the code uses oAuth Client to access the google calendar and if it fails it doesnt crash the code
+# how the code uses oAuth Client to access the google calendar and if it fails it doesnt crash the code
 try:
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -51,13 +51,14 @@ try:
     GOOGLE_LIBS_AVAILABLE = True
 except ImportError:
     GOOGLE_LIBS_AVAILABLE = False
- 
+
 CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar.events',
                    'https://www.googleapis.com/auth/calendar.readonly']
- 
- 
- 
+
+
 def ask_agent():
+    """Lets the user pick between the two agents, and loops back here whenever
+    either agent returns 'switch' instead of quitting entirely."""
     while True:
         which = input("Which Agent would you like to use? (1 = UI Design Agent, 2 = UX Helper AI): ").strip().lower()
         if which == '1' or 'agent 1' in which:
@@ -72,16 +73,15 @@ def ask_agent():
             break
 
 
- #checks if the credentials.json exists and uses it to to acceess the google calendar and returns None so an error doesnt appear. Also uses tokens.json if its previously logged in.
+# checks if the credentials.json exists and uses it to access the google calendar and
+# returns None so an error doesn't appear. Also uses token.json if previously logged in.
 def get_calendar_service():
     """Returns an authenticated Google Calendar service, or None if unavailable/not set up."""
     if not GOOGLE_LIBS_AVAILABLE:
         return None
     if not os.path.exists(CREDS_FILE):
         return None
- 
 
-    #creates credentials if non existent
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, CALENDAR_SCOPES)
@@ -93,14 +93,17 @@ def get_calendar_service():
             creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, 'w', encoding='utf-8') as f:
             f.write(creds.to_json())
- 
+
     return build('calendar', 'v3', credentials=creds)
- 
- # when accessing the google calendar it finds busy and free times with in the next 28 days and fills them according to the user request.
+
+
+# when accessing the google calendar it finds busy and free times within the next 28 days
 def fetch_google_busy_times(service, days_ahead=28):
     """Returns a plain-text list of upcoming events so Claude can schedule around them."""
-    now = datetime.utcnow().isoformat()
-    end = (datetime.utcnow() + timedelta(days=days_ahead)).isoformat()
+    # datetime.now(timezone.utc) is timezone-AWARE, which Google's API requires —
+    # bare datetime.utcnow() is deprecated and produces timestamps Google rejects.
+    now = datetime.now(timezone.utc).isoformat()
+    end = (datetime.now(timezone.utc) + timedelta(days=days_ahead)).isoformat()
     events_result = service.events().list(
         calendarId='primary', timeMin=now, timeMax=end,
         singleEvents=True, orderBy='startTime'
@@ -109,17 +112,15 @@ def fetch_google_busy_times(service, days_ahead=28):
     if not events:
         return "No upcoming events found."
     lines = []
-    #creates and finds the time to add the task to the calendar in a formatable way.
     for e in events:
         start = e['start'].get('dateTime', e['start'].get('date'))
         end_t = e['end'].get('dateTime', e['end'].get('date'))
         lines.append(f"{e.get('summary', '(busy)')}: {start} - {end_t}")
     return "\n".join(lines)
- 
- #creates the actual event with the description summary and uses the date as well.
 
 
 def show_loading(stop_event, message="Thinking"):
+    """Animates a '...' loading line in the terminal until stop_event is set."""
     dots = 0
     while not stop_event.is_set():
         sys.stdout.write(f"\r{message}{'.' * (dots % 4):<4}")
@@ -131,7 +132,8 @@ def show_loading(stop_event, message="Thinking"):
 
 
 def with_loading(func, message="Thinking"):
-    """Runs func() while showing an animated loading line in the terminal."""
+    """Runs func() while showing an animated loading line in the terminal.
+    Every Claude API call in this file should be wrapped in this."""
     result = {}
     def target():
         result['value'] = func()
@@ -144,6 +146,7 @@ def with_loading(func, message="Thinking"):
     stop_event.set()
     spinner.join()
     return result['value']
+
 
 def create_calendar_events(service, sessions):
     """Inserts parsed schedule sessions as events on the user's primary calendar."""
@@ -161,8 +164,8 @@ def create_calendar_events(service, sessions):
         except Exception as e:
             print(f"Could not add session '{s.get('title')}': {e}")
     return created
- 
- 
+
+
 def describe_calendar_image(path):
     """Sends a photo/screenshot of an existing calendar to Claude and returns the busy slots it sees."""
     if not os.path.exists(path):
@@ -171,10 +174,10 @@ def describe_calendar_image(path):
     ext = path.lower().rsplit('.', 1)[-1]
     media_type = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
                   'webp': 'image/webp'}.get(ext, 'image/jpeg')
-    #reads the image file in binary instead of regular text, and ensures that the result is a regular python string. 'rb' is read binary instead of 'r,' read.
+
     with open(path, 'rb') as f:
         img_b64 = base64.b64encode(f.read()).decode('utf-8')
- 
+
     response = with_loading(lambda: client.messages.create(
         model=MODEL,
         max_tokens=500,
@@ -188,45 +191,45 @@ def describe_calendar_image(path):
         }]
     ))
     return response.content[0].text
- 
- 
+
+
 def extract_json_sessions(text):
     """Pulls the fenced ```json [...] ``` block out of Claude's schedule response, if present."""
-    match = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL) #searches for specific characters and find the important information and creates empty space to make it readable. #uses re library to search for and replace characters.
+    match = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
     if not match:
         return []
     try:
         return json.loads(match.group(1))
     except json.JSONDecodeError:
         return []
- 
- 
+
+
 def strip_json_block(text):
-    return re.sub(r'```json.*?```', '', text, flags=re.DOTALL).strip()#again, re.sub uses the re library to substitue xyz, with zyx.
- 
- 
+    return re.sub(r'```json.*?```', '', text, flags=re.DOTALL).strip()
+
+
 def ask_claude(system, messages, max_tokens=800, temperature=0.7, tools=None):
     kwargs = dict(model=MODEL, max_tokens=max_tokens, temperature=temperature,
                   system=system, messages=messages)
     if tools:
         kwargs['tools'] = tools
     return with_loading(lambda: client.messages.create(**kwargs))
- 
- 
+
+
 def cmd_schedule(history):
     """Build a work schedule for the UI project around the user's free time / existing calendar."""
     print("\nLet's build a schedule around your actual free time.")
     project = goal or input("What is the project or app name? (or leave blank): ")
     deadline = input("Any deadline or target date? (or leave blank): ")
- 
+
     calendar_choice = input(
         "Pull busy times from an existing calendar first? "
         "(google / image / no): "
     ).strip().lower()
- 
+
     busy_info = ""
     calendar_service = None
-    #user is asked 3 options for the calendar, google calendar, python HTML file, or manual. google uses get_calendar_service() to access the authetnticator client and edit tasks.
+
     if calendar_choice == 'google':
         calendar_service = get_calendar_service()
         if calendar_service:
@@ -235,31 +238,30 @@ def cmd_schedule(history):
         else:
             print("Google Calendar isn't set up yet (see README.md for one-time setup).")
             print("Continuing without it — you can still describe your free time manually.")
-    #uses binary to read the image file through describe_calendar_image(img_path) - where image path is the file name of the downloaded image.
     elif calendar_choice == 'image':
         img_path = input("Path to a screenshot/photo of your calendar: ").strip()
         busy_info = describe_calendar_image(img_path)
         if busy_info:
             print("Read your calendar image.")
- 
+
     free_time = input("Describe your free time (e.g. 'Mon/Wed/Fri evenings 7-9pm, Sat afternoon'): ")
- 
+
     today = datetime.now().strftime('%Y-%m-%d')
     prompt = f"""Create a realistic UI-design work schedule.
- 
+
 Today's date: {today}
 Project: {project}
 Deadline: {deadline or 'none given'}
 Existing commitments already on the calendar: {busy_info or 'none provided'}
 User-stated free time: {free_time}
- 
+
 Break the work into UI-design stages (research/moodboard, wireframes, high-fidelity
 mockups, review/iterate) and slot them into real upcoming dates within the user's
 free time, avoiding the existing commitments listed above. Aim for 2-hour sessions
 unless the free-time slot is shorter.
- 
+
 First, output a short human-readable markdown table: Session | Date | Time | Focus | Deliverable.
- 
+
 Then, output the exact same sessions as a fenced JSON block with this schema:
 ```json
 [{{"date": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM", "title": "short title", "focus": "what this session covers"}}]
@@ -272,15 +274,15 @@ Then, output the exact same sessions as a fenced JSON block with this schema:
     )
     plan_text = response.content[0].text
     sessions = extract_json_sessions(plan_text)
- 
+
     with open(SCHEDULE_FILE, 'a', encoding='utf-8') as f:
         f.write(f"\n\n## Schedule generated {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
         f.write(f"Project: {project}\n\n")
         f.write(plan_text)
- 
+
     print(f"\n{strip_json_block(plan_text)}\n")
     print(f"Saved to {SCHEDULE_FILE}")
- 
+
     if sessions:
         if calendar_service is None:
             calendar_service = get_calendar_service()
@@ -292,25 +294,24 @@ Then, output the exact same sessions as a fenced JSON block with this schema:
         else:
             print("\n(Google Calendar not connected — sessions saved to schedule.md only. "
                   "See README.md if you'd like to enable calendar sync.)")
- 
- 
 
- #creates an HTML file that automatically downloads on your computer and is linked in your fies.
+
 def cmd_mockup(user_message=None):
-    """Generate a self-contained HTML/CSS file for a described screen, then open it in a browser."""
+    """Generate a self-contained HTML/CSS file for a described screen, then open it in a browser.
+    Returns the path to the saved file (so it can be tracked for later edits)."""
     if user_message:
         description = user_message
     else:
         description = input("\nDescribe the screen/component you want mocked up: ")
     style_notes = input("Any style direction? (colors, mood, brand — or leave blank): ")
- 
+
     prompt = f"""Generate a single self-contained HTML file (inline <style>, no external
 dependencies except optionally Google Fonts) that implements this UI screen as a
 static, realistic-looking mockup:
- 
+
 Screen: {description}
 Style direction: {style_notes or 'use your best judgment, keep it clean and modern'}
- 
+
 Requirements:
 - Fully valid HTML5 document (doctype, head, body).
 - All CSS inline in a <style> tag.
@@ -328,26 +329,23 @@ Requirements:
     code = response.content[0].text.strip()
     code = re.sub(r'^```(?:html)?\n?', '', code)
     code = re.sub(r'\n?```$', '', code)
-    #
- 
-    #only keeps files created that starts with mockup reducing clutter and possible overwriting or overlapping.
+
     existing = [f for f in os.listdir(MOCKUP_DIR) if f.startswith('mockup_')]
     n = len(existing) + 1
     filename = os.path.join(MOCKUP_DIR, f'mockup_{n}.html')
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(code)
- 
+
     print(f"\nSaved mockup to {filename}")
     try:
         webbrowser.open(f'file://{os.path.abspath(filename)}')
         print("Opened it in your browser.")
     except Exception:
         print("Open it manually in a browser to view it.")
+
     return filename
 
- 
 
- #uses similair code to the previous mockup function but reads the current HTML code and alters it in the way asked by the user, instead of making a new mockup each time.
 def cmd_edit_mockup(instruction, filepath):
     """Applies a natural-language change to an existing mockup file, in place."""
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -389,27 +387,28 @@ change. Output ONLY the HTML code, no explanation, no markdown code fences."""
     return filepath
 
 
-#generates the file with the basics of UI according to the app, audience, and platform.
 def cmd_basics():
     """Create a UI fundamentals reference file, tailored to the user's specific app and audience,
-    including a web-researched section on designing for that audience."""
+    including a web-researched section on designing for that audience. Returns the full text
+    so it can be kept in memory for follow-up questions."""
     print("\nLet's tailor this to your actual app.")
     app_desc = input("What does your app do? (one or two sentences): ")
     audience = input("Who is it for? (age range, profession, context of use, etc.): ")
     platform = input("What platform is it for? (iOS, Android, web, desktop...): ")
-    #if its not the first time creating a file, it asks to overwrite a file.
+
     if os.path.exists(BASICS_FILE):
         overwrite = input("\nui_design_basics.md already exists. Regenerate it? (y/N): ")
         if overwrite.lower() != 'y':
             print(f"Keeping existing file at {BASICS_FILE}")
-            return
- 
+            with open(BASICS_FILE, 'r', encoding='utf-8') as f:
+                return f.read()
+
     general_prompt = """Write a concise, practical reference covering the fundamentals of
 UI design for a beginner building their own app. Cover: visual hierarchy, color
 theory basics, typography basics, spacing/layout (grids, whitespace), contrast &
 accessibility, consistency & design systems, and common beginner mistakes. Use
 markdown headers and short bullet points, not long paragraphs. Keep it under 500 words."""
- 
+
     general_response = ask_claude(
         system="You are a UI/UX educator who writes clear, beginner-friendly reference material.",
         messages=[{'role': 'user', 'content': general_prompt}],
@@ -417,23 +416,23 @@ markdown headers and short bullet points, not long paragraphs. Keep it under 500
         temperature=0.5,
     )
     general_content = general_response.content[0].text
- 
+
     print("\nLooking up current design guidance for your specific audience...")
     search_prompt = f"""Search the web for current, specific UI/UX design guidance relevant to this app:
- 
+
 App: {app_desc}
 Target audience: {audience}
 Platform: {platform}
- 
+
 Find and summarize practical guidance on: accessibility needs specific to this
 audience, interaction patterns this audience already expects, color/typography
 considerations, platform-specific conventions (e.g. iOS Human Interface Guidelines,
 Material Design) if relevant, and common usability pitfalls for this audience.
 Write it as actionable markdown bullet points grouped under short subheadings.
 Briefly note the source of any specific claim in parentheses."""
- 
+
     search_response = with_loading(lambda: client.messages.create(
-        model=MODEL, 
+        model=MODEL,
         max_tokens=1200,
         system="You are a UX researcher. Use web search to find current, specific, practical "
                "UI design guidance. Keep it concise and actionable.",
@@ -445,45 +444,143 @@ Briefly note the source of any specific claim in parentheses."""
     ).strip()
     if not audience_content:
         audience_content = "(Web search returned no usable results — check that your Anthropic account has web search enabled.)"
- 
+
     full_content = f"""# UI Design Basics — tailored for: {app_desc}
- 
+
 **Target audience:** {audience}
 **Platform:** {platform}
- 
+
 {general_content}
- 
+
 ## Audience & Platform-Specific Considerations
- 
+
 {audience_content}
 """
- #adds the information to the document, making a full document and savings it to the file.
+
     with open(BASICS_FILE, 'w', encoding='utf-8') as f:
         f.write(full_content)
- 
+
     print(f"\n{full_content}\n")
     print(f"Saved to {BASICS_FILE}")
- 
 
-# -----------------------------
-# Tool Function
-# -----------------------------
+    return full_content
+
+
+def read_text_file(path):
+    """Reads a file from disk and returns its text content, regardless of format.
+    Figures out how to read it based on the file's extension (.txt, .pdf, .docx, etc.)."""
+    if not os.path.exists(path):
+        print(f"File not found: {path}")
+        return None
+
+    ext = path.lower().rsplit('.', 1)[-1]
+
+    try:
+        if ext == 'pdf':
+            return read_pdf_file(path)
+        elif ext == 'docx':
+            return read_docx_file(path)
+        else:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+    except Exception as e:
+        print(f"Could not read file: {e}")
+        return None
+
+
+def read_pdf_file(path):
+    """Extracts all the text from a PDF, page by page, and joins it into one string."""
+    reader = pypdf.PdfReader(path)
+    pages_text = [page.extract_text() or '' for page in reader.pages]
+    return "\n\n".join(pages_text)
+
+
+def read_docx_file(path):
+    """Extracts all the text from a Word document, paragraph by paragraph."""
+    doc = DocxDocument(path)
+    paragraphs_text = [p.text for p in doc.paragraphs]
+    return "\n".join(paragraphs_text)
+
+
+def chunk_text(text, chunk_size=12000):
+    """Splits a long piece of text into smaller pieces, breaking at paragraph gaps where possible."""
+    chunks = []
+    while len(text) > chunk_size:
+        split_at = text.rfind('\n\n', 0, chunk_size)
+        if split_at == -1:
+            split_at = chunk_size
+        chunks.append(text[:split_at])
+        text = text[split_at:]
+    if text.strip():
+        chunks.append(text)
+    return chunks
+
+
+def summarize_large_text(text, instruction="Summarize this document, highlighting the key points."):
+    """Summarizes/analyzes text of any length using a map-reduce approach for long documents."""
+    chunks = chunk_text(text)
+
+    if len(chunks) == 1:
+        response = ask_claude(
+            system="You are a careful analyst. Summarize and analyze text accurately, without inventing details.",
+            messages=[{'role': 'user', 'content': f"{instruction}\n\nText:\n{chunks[0]}"}],
+            max_tokens=800,
+        )
+        return response.content[0].text
+
+    partial_summaries = []
+    for i, chunk in enumerate(chunks):
+        print(f"Reading section {i + 1}/{len(chunks)}...")
+        response = ask_claude(
+            system="You are a careful analyst. Summarize this section accurately and concisely.",
+            messages=[{'role': 'user', 'content': f"Summarize this section of a larger document:\n\n{chunk}"}],
+            max_tokens=400,
+        )
+        partial_summaries.append(response.content[0].text)
+
+    combined = "\n\n".join(partial_summaries)
+    final_response = ask_claude(
+        system="You are a careful analyst. Combine these section summaries into one coherent overall answer.",
+        messages=[{'role': 'user', 'content': f"{instruction}\n\nSection summaries:\n{combined}"}],
+        max_tokens=800,
+    )
+    return final_response.content[0].text
+
+
+def cmd_analyze_file(user_message=None):
+    """Reads a file (or accepts pasted text) and summarizes/analyzes it."""
+    if user_message and user_message.strip().lower() not in ('read file', 'analyze file', 'summarize file'):
+        path_guess = user_message.strip()
+    else:
+        path_guess = input("\nPath to the file (or paste the text directly): ").strip()
+
+    if os.path.exists(path_guess):
+        content = read_text_file(path_guess)
+        if content is None:
+            return
+    else:
+        content = path_guess
+
+    instruction = input("What would you like to know? (or leave blank for a general summary): ").strip()
+    if not instruction:
+        instruction = "Summarize this document, highlighting the key points."
+
+    print("\nAnalyzing...")
+    result = summarize_large_text(content, instruction)
+    print(f"\n{result}\n")
+
+
 def export_to_file(content):
     filename = "UX_Report.txt"
-
     with open(filename, "w", encoding="utf-8") as file:
         file.write(content)
-
     return filename
 
 
-# -----------------------------
-# Chat Function
-# -----------------------------
 def running_chat():
-
     print("=== UX Helper AI ===")
     print("Type 'export' to save the conversation.")
+    print("Type 'switch' to change agents.")
     print("Type 'reset' to clear the chat.")
     print("Type 'exit' to quit.\n")
 
@@ -522,13 +619,12 @@ Suggest one concrete action the user can take.
 """
 
     while True:
-
         user_input = input("\nYou: ")
 
         if user_input.lower() == "exit":
             print("Goodbye!")
             return 'exit'
-        
+
         if user_input.lower() == "switch":
             print("Switching agents...")
             return 'switch'
@@ -539,23 +635,14 @@ Suggest one concrete action the user can take.
             continue
 
         if user_input.lower() == "export":
-
             conversation = ""
-
             for message in history:
                 conversation += f"{message['role'].upper()}:\n{message['content']}\n\n"
-
             filename = export_to_file(conversation)
-
             print(f"Conversation exported to {filename}")
             continue
 
-        history.append(
-            {
-                "role": "user",
-                "content": user_input
-            }
-        )
+        history.append({"role": "user", "content": user_input})
 
         response = with_loading(lambda: client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -566,59 +653,54 @@ Suggest one concrete action the user can take.
         ))
 
         reply = response.content[0].text
-
         print("\nUX Helper AI:")
         print(reply)
 
-        history.append(
-            {
-                "role": "assistant",
-                "content": reply
-            }
-        )
+        history.append({"role": "assistant", "content": reply})
 
 
 def run_chat():
-    print("You: Pixel here — your UI design assistant.")
-    print("Commands: 'schedule' (plan work around your free time / calendar), 'mockup' (generate an HTML mockup),")
-    print("          'basics' (tailored UI design reference), 'summary', 'reset', 'exit'")
+    print("Welcome! Pixel here — your UI design assistant.")
+    print("Commands: 'schedule', 'mockup', 'basics', 'analyze file', 'summary', 'switch', 'reset', 'exit'")
     global goal
     goal = input("\nWhat are you designing / what's your goal for this session?: ")
+    username = input("Pixel: What should I call you? ").strip()
     history = []
- 
+
     system_message = SYSTEM_MESSAGE + f"\n\nThe user's current goal for this session: {goal}"
 
-    lastmockup_path = None  # Track the last mockup file path for potential edits
+    lastmockup_path = None       # tracks the last mockup file path, for edit requests
+    lastbasics_content = None    # tracks the last generated guide, for follow-up questions
+
     while True:
-        user_input = input('\n>> ').strip()
- 
+        user_input = input(f'\n>> {username.capitalize() if username else ""}: ').strip()
+
         if user_input == '':
             print("Please enter a message.")
             continue
- 
+
         low = user_input.lower()
- 
+
         if low == 'exit' or 'quit' in low or 'bye' in low or 'goodbye' in low or 'end' in low:
             print("Exiting. Good luck with the design!")
             return 'exit'
- 
-        if low == 'help' or 'commands' in low or 'options' in low:
-            print("Available commands: 'schedule', 'mockup', 'basics', 'summary', 'reset', 'exit'")
-            continue
 
+        if low == 'switch' or 'switch agent' in low or 'change agent' in low:
+            print('Switching agents...')
+            return 'switch'
+
+        if low == 'help' or 'commands' in low or 'options' in low:
+            print("Available commands: 'schedule', 'mockup', 'basics', 'analyze file', 'summary', 'switch', 'reset', 'exit'")
+            continue
 
         if low == 'reset' or 'reset' in low or 'clear' in low:
             history = []
             print("History cleared.")
             continue
- 
+
         if low == 'schedule' or 'schedule' in low or 'calendar' in low or 'plan' in low:
             cmd_schedule(history)
             continue
- 
-        if low == 'switch' or 'switch' in low:
-            print('Switching agents...')
-            return 'switch'
 
         if low == 'mockup' or 'mockup' in low or 'html' in low or 'prototype' in low:
             edit_list = ['change', 'edit', 'update', 'modify', 'replace', 'can you', 'make it', 'adjust', 'improve', 'fix']
@@ -630,11 +712,37 @@ def run_chat():
                     print("No previous mockup found to edit. Please create a mockup first.")
                 lastmockup_path = cmd_mockup(user_input)
             continue
- 
-        if low == 'basics' or 'basics' in low or 'reference' in low or 'guide' in low:
-            cmd_basics()
+
+        if low in ('read file', 'analyze file', 'summarize file') or 'analyze' in low or 'summarize' in low:
+            cmd_analyze_file(user_input)
             continue
- 
+
+        if low == 'basics' or 'basics' in low or 'reference' in low or 'guide' in low:
+            question_words = ['what', 'why', 'how', 'explain', 'elaborate', 'clarify', 'mean', 'tell me more', '?']
+            is_question = any(w in low for w in question_words)
+
+            # if there's no guide in memory yet (e.g. program was just restarted), try
+            # loading it from disk before falling back to generating a fresh one
+            if is_question and not lastbasics_content and os.path.exists(BASICS_FILE):
+                with open(BASICS_FILE, 'r', encoding='utf-8') as f:
+                    lastbasics_content = f.read()
+
+            if is_question and lastbasics_content:
+                # follow-up question about an existing guide — answer using it as context,
+                # instead of regenerating the whole document
+                history.append({
+                    'role': 'user',
+                    'content': f"Here is the design guide you generated earlier:\n\n{lastbasics_content}\n\n"
+                               f"Follow-up question: {user_input}"
+                })
+                response = ask_claude(system_message, history, max_tokens=500)
+                reply = response.content[0].text
+                history.append({'role': 'assistant', 'content': reply})
+                print(f"\nPixel: {reply}")
+            else:
+                lastbasics_content = cmd_basics()
+            continue
+
         if low == 'summary' or 'summary' in low or 'recap' in low or 'review' in low:
             if not history:
                 print("No conversation history to summarize.")
@@ -646,22 +754,19 @@ def run_chat():
             )
             print(f"Summary: {summary.content[0].text}")
             continue
- 
+
         history.append({'role': 'user', 'content': user_input})
- 
+
         response = ask_claude(system_message, history, max_tokens=500)
         reply = response.content[0].text
         history.append({'role': 'assistant', 'content': reply})
- 
+
         print(f"\nPixel: {reply}")
- 
+
         usage = response.usage
         total = usage.input_tokens + usage.output_tokens
         print(f"[tokens: {usage.input_tokens} in / {usage.output_tokens} out / {total} total]")
- 
- 
+
+
 if __name__ == '__main__':
     ask_agent()
- 
-
-

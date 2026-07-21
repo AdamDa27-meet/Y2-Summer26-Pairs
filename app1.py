@@ -1,13 +1,13 @@
-
+import pypdf
 import os
 import re
 import json
 import base64
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
 from dotenv import load_dotenv
- 
+from docx import Document as DocxDocument
 load_dotenv()
  
 client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
@@ -81,8 +81,8 @@ def get_calendar_service():
  # when accessing the google calendar it finds busy and free times with in the next 28 days and fills them according to the user request.
 def fetch_google_busy_times(service, days_ahead=28):
     """Returns a plain-text list of upcoming events so Claude can schedule around them."""
-    now = datetime.utcnow().isoformat()
-    end = (datetime.utcnow() + timedelta(days=days_ahead)).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    end = (datetime.now(timezone.utc) + timedelta(days=days_ahead)).isoformat()
     events_result = service.events().list(
         calendarId='primary', timeMin=now, timeMax=end,
         singleEvents=True, orderBy='startTime'
@@ -415,7 +415,138 @@ Briefly note the source of any specific claim in parentheses."""
  
     print(f"\n{full_content}\n")
     print(f"Saved to {BASICS_FILE}")
- 
+
+    return full_content
+
+def read_text_file(path):
+    """Reads a file from disk and returns its text content, regardless of format.
+    Figures out how to read it based on the file's extension (.txt, .pdf, .docx, etc.)."""
+    if not os.path.exists(path):
+        print(f"File not found: {path}")
+        return None
+
+    # rsplit('.', 1) splits the filename at the LAST dot only, so "my.file.pdf" -> ['my.file', 'pdf']
+    # [-1] grabs the last piece (the extension itself), .lower() so ".PDF" and ".pdf" both match
+    ext = path.lower().rsplit('.', 1)[-1]
+
+    try:
+        if ext == 'pdf':
+            return read_pdf_file(path)
+        elif ext == 'docx':
+            return read_docx_file(path)
+        else:
+            # Fallback for plain text-based files: .txt, .md, .csv, .py, .json, etc.
+            # errors='ignore' means: if the file has a few weird/broken characters, skip them
+            # instead of crashing the whole read.
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+    except Exception as e:
+        print(f"Could not read file: {e}")
+        return None
+
+
+def read_pdf_file(path):
+    """Extracts all the text from a PDF, page by page, and joins it into one string."""
+    reader = pypdf.PdfReader(path)
+    # This is a list comprehension: for every page in the PDF, grab its text.
+    # "or ''" handles pages that come back empty (like a page that's just an image) —
+    # without it, joining could crash if any page returns None instead of text.
+    pages_text = [page.extract_text() or '' for page in reader.pages]
+    return "\n\n".join(pages_text)
+
+
+def read_docx_file(path):
+    """Extracts all the text from a Word document, paragraph by paragraph."""
+    doc = DocxDocument(path)
+    # Each paragraph is a separate object with its own .text — grab them all and join with newlines.
+    paragraphs_text = [p.text for p in doc.paragraphs]
+    return "\n".join(paragraphs_text)
+
+
+def chunk_text(text, chunk_size=12000):
+    """Splits a long piece of text into smaller pieces (chunks), each roughly chunk_size
+    characters long. This matters because very long documents can be too big to send to
+    Claude in a single request — this breaks them into manageable pieces first.
+    Tries to break at a paragraph gap (blank line) rather than mid-sentence, so each
+    chunk still reads naturally."""
+    chunks = []
+    while len(text) > chunk_size:
+        # rfind searches BACKWARDS from position chunk_size, looking for a blank line (\n\n)
+        # so we cut between paragraphs instead of in the middle of a sentence.
+        split_at = text.rfind('\n\n', 0, chunk_size)
+        if split_at == -1:
+            # no paragraph break found nearby — just cut at the raw character limit instead
+            split_at = chunk_size
+        chunks.append(text[:split_at])
+        text = text[split_at:]  # keep only what's left, and loop again
+    if text.strip():  # add whatever's left over, if it's not just blank space
+        chunks.append(text)
+    return chunks
+
+
+def summarize_large_text(text, instruction="Summarize this document, highlighting the key points."):
+    """Summarizes or analyzes text of ANY length.
+    - If the text is short enough to fit in one request, just sends it directly.
+    - If it's too long, this uses a 'map-reduce' approach: summarize each chunk
+      separately first (the 'map' step), then combine those mini-summaries into
+      one final coherent answer (the 'reduce' step)."""
+    chunks = chunk_text(text)
+
+    if len(chunks) == 1:
+        # Short enough — one simple request, no need to chunk anything.
+        response = ask_claude(
+            system="You are a careful analyst. Summarize and analyze text accurately, without inventing details.",
+            messages=[{'role': 'user', 'content': f"{instruction}\n\nText:\n{chunks[0]}"}],
+            max_tokens=800,
+        )
+        return response.content[0].text
+
+    # Long document — summarize each piece one at a time first.
+    partial_summaries = []
+    for i, chunk in enumerate(chunks):
+        print(f"Reading section {i + 1}/{len(chunks)}...")
+        response = ask_claude(
+            system="You are a careful analyst. Summarize this section accurately and concisely.",
+            messages=[{'role': 'user', 'content': f"Summarize this section of a larger document:\n\n{chunk}"}],
+            max_tokens=400,
+        )
+        partial_summaries.append(response.content[0].text)
+
+    # Now combine all those mini-summaries into one final, coherent answer.
+    combined = "\n\n".join(partial_summaries)
+    final_response = ask_claude(
+        system="You are a careful analyst. Combine these section summaries into one coherent overall answer.",
+        messages=[{'role': 'user', 'content': f"{instruction}\n\nSection summaries:\n{combined}"}],
+        max_tokens=800,
+    )
+    return final_response.content[0].text
+
+
+def cmd_analyze_file(user_message=None):
+    """Command handler: asks for a file path (or accepts pasted text directly),
+    reads it, and summarizes/analyzes it based on what the user wants to know."""
+    # If the trigger message has more than just a bare command word in it, treat
+    # that message itself as the path/text — same pattern as cmd_mockup.
+    if user_message and user_message.strip().lower() not in ('read file', 'analyze file', 'summarize file'):
+        path_guess = user_message.strip()
+    else:
+        path_guess = input("\nPath to the file (or paste the text directly): ").strip()
+
+    if os.path.exists(path_guess):
+        content = read_text_file(path_guess)
+        if content is None:  # reading failed (bad file, unsupported type, etc.)
+            return
+    else:
+        # Not a real file path on disk — assume they pasted the actual text instead.
+        content = path_guess
+
+    instruction = input("What would you like to know? (or leave blank for a general summary): ").strip()
+    if not instruction:
+        instruction = "Summarize this document, highlighting the key points."
+
+    print("\nAnalyzing...")
+    result = summarize_large_text(content, instruction)
+    print(f"\n{result}\n")
  
 def run_chat():
     print("You: Pixel here — your UI design assistant.")
@@ -428,8 +559,11 @@ def run_chat():
     system_message = SYSTEM_MESSAGE + f"\n\nThe user's current goal for this session: {goal}"
 
     lastmockup_path = None  # Track the last mockup file path for potential edits
+    lastbasics = None
+    username = input("Pixel: What should I call you?")
+
     while True:
-        user_input = input('\n>> ').strip()
+        user_input = input(f'\n >> {username.capitalize()}:').strip()
  
         if user_input == '':
             print("Please enter a message.")
@@ -464,11 +598,25 @@ def run_chat():
                 if edit_detected and not lastmockup_path:
                     print("No previous mockup found to edit. Please create a mockup first.")
                 lastmockup_path = cmd_mockup(user_input)
-            cmd_mockup(history)
             continue
  
         if low == 'basics' or 'basics' in low or 'reference' in low or 'guide' in low:
-            cmd_basics()
+            question_words = ['what', 'why', 'how', 'explain', 'elaborate', 'clarify', 'mean', 'tell me more', '?']
+            is_question = any(w in low for w in question_words)
+
+            if is_question and lastbasics_content:
+#follow up questions handling
+                history.append({
+                    'role': 'user',
+                    'content': f"Here is the design guide you generated earlier:\n\n{lastbasics_content}\n\n"
+                                f"Follow-up question: {user_input}"
+                    })
+                response = ask_claude(system_message, history, max_tokens=500)
+                reply = response.content[0].text
+                history.append({'role': 'assistant', 'content': reply})
+                print(f"\nPixel: {reply}")
+            else:
+                lastbasics_content = cmd_basics()
             continue
  
         if low == 'summary' or 'summary' in low or 'recap' in low or 'review' in low:
