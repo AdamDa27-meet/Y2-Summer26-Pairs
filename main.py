@@ -106,8 +106,9 @@ WHAT YOU WILL NOT DO:
 - Do not generate code.
 - Keep answers focused on UX.
 """
+    pixel_history = []
     ux_history = []
-    ui_history = []
+
     username = input("AI: What should I call you? ").strip()
 
     while True:
@@ -146,8 +147,8 @@ WHAT YOU WILL NOT DO:
         ux_reply = ux_response.content[0].text
 
     
-        pixel_history.append({'role': 'user', 'content': pixel_reply})
-        ux_history.append({'role': 'user', 'content': ux_reply})
+        pixel_history.append({'role': 'assistant', 'content': pixel_reply})
+        ux_history.append({'role': 'assitant', 'content': ux_reply})
 
         current, winner = judge_and_combine(user_input, pixel_reply, ux_reply)
 
@@ -868,12 +869,12 @@ def run_chat():
             print("History cleared.")
             continue
 
-        if low == 'schedule' or 'schedule' in low or 'calendar' in low or 'plan' in low:
+        if low == 'schedule' or 'schedule' in low or 'calendar' in low:
             cmd_schedule(history)
             continue
 
         if low == 'mockup' or 'mockup' in low or 'html' in low or 'prototype' in low:
-            edit_list = ['change', 'edit', 'update', 'modify', 'replace', 'can you', 'make it', 'adjust', 'improve', 'fix']
+            edit_list = ['change', 'edit', 'update', 'modify', 'replace', 'make it', 'adjust', 'improve', 'fix']
             edit_detected = any(word in low for word in edit_list)
             if edit_detected and lastmockup_path:
                 cmd_edit_mockup(user_input, lastmockup_path)
